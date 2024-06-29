@@ -12,15 +12,6 @@ func logRaw(format string, args ...interface{}) {
 	fmt.Printf(format+"\n", args...)
 }
 
-func logTitle(format string, args ...interface{}) {
-	logInfo(format, args...)
-
-	title := strings.Repeat("-", len(fmt.Sprintf(format, args...)))
-	if len(title) > 0 {
-		logInfo(title)
-	}
-}
-
 func logInfo(format string, args ...interface{}) {
 	if StartParams.Raw {
 		logRaw(format, args...)
@@ -82,22 +73,6 @@ func startsWith(str, prefix string, cs caseSensitivity) bool {
 func startsWithAny(str string, prefixes []string, cs caseSensitivity) bool {
 	for _, prefix := range prefixes {
 		if startsWith(str, prefix, cs) {
-			return true
-		}
-	}
-	return false
-}
-
-func endsWith(str, postfix string, cs caseSensitivity) bool {
-	if cs == caseSensitive {
-		return strings.HasSuffix(str, postfix)
-	}
-	return strings.HasSuffix(strings.ToLower(str), strings.ToLower(postfix))
-}
-
-func endsWithAny(str string, postfixes []string, cs caseSensitivity) bool {
-	for _, postfix := range postfixes {
-		if endsWith(str, postfix, cs) {
 			return true
 		}
 	}

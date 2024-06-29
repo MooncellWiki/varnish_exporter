@@ -122,7 +122,7 @@ func main() {
 	}
 
 	// Test run or user explicitly wants to exit on any scrape errors during runtime.
-	ExitHandler.exitOnError = StartParams.Test == true || StartParams.ExitOnErrors == true
+	ExitHandler.exitOnError = StartParams.Test || StartParams.ExitOnErrors
 
 	if b, err := json.MarshalIndent(StartParams, "", "  "); err == nil {
 		logInfo("%s %s %s", ApplicationName, getVersion(false), b)
@@ -159,7 +159,7 @@ func main() {
 		<-done
 
 		if err == nil {
-			logInfo("Test scrape done in %s", time.Now().Sub(tStart))
+			logInfo("Test scrape done in %s", time.Since(tStart))
 			logRaw("")
 		} else {
 			if len(buf) > 0 {
