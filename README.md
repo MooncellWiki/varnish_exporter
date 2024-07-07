@@ -1,5 +1,3 @@
-[![Build Status](https://travis-ci.com/jonnenauha/prometheus_varnish_exporter.svg?branch=master)](https://travis-ci.com/github/jonnenauha/prometheus_varnish_exporter)
-
 # Varnish exporter for Prometheus
 
 ![Grafana example](dashboards/jonnenauha/dashboard.png)
@@ -75,12 +73,12 @@ You need go 1.11 or higher, otherwise you can keep using `GOPATH` based developm
 
 ```bash
 # clone
-git clone git@github.com:jonnenauha/prometheus_varnish_exporter.git
+git clone https://github.com/MooncellWiki/varnish_exporter.git
 cd prometheus_varnish_exporter
 
 # build binary to current directory
 go build
 
 # release with cross compilation
-./build.sh <version>
+goreleaser release --snapshot --clean
 ```
