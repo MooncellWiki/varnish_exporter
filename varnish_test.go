@@ -164,6 +164,7 @@ func Test_VarnishMetrics(t *testing.T) {
 	}
 	for _, version := range testFileVersions {
 		test := filepath.Join(dir, "test/scrape", version+".json")
+		// nolint: errcheck
 		VarnishVersion.parseVersion(version)
 		t.Logf("test scrape %s", VarnishVersion)
 
@@ -283,6 +284,7 @@ func Test_PrometheusExport(t *testing.T) {
 	}
 	for _, version := range testFileVersions {
 		test := filepath.Join(dir, "test/scrape", version+".json")
+		// nolint: errcheck
 		VarnishVersion.parseVersion(version)
 		t.Logf("test scrape %s", VarnishVersion)
 

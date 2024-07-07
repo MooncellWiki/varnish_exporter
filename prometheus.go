@@ -80,6 +80,7 @@ func (pe *prometheusExporter) Collect(ch chan<- prometheus.Metric) {
 	hadError := ExitHandler.HasError()
 
 	_, err := ScrapeVarnish(ch)
+	// nolint: errcheck
 	ExitHandler.Set(err)
 
 	if err == nil {

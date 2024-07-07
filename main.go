@@ -132,6 +132,7 @@ func main() {
 
 	// Initialize
 	if err := VarnishVersion.Initialize(); err != nil {
+		// nolint: errcheck
 		ExitHandler.Errorf("Varnish version initialize failed: %s", err.Error())
 	}
 	if VarnishVersion.Valid() {
@@ -165,6 +166,7 @@ func main() {
 			if len(buf) > 0 {
 				logRaw("\n%s", buf)
 			}
+			// nolint: errcheck
 			ExitHandler.Errorf("Startup test: %s", err.Error())
 		}
 	}
@@ -191,6 +193,7 @@ func main() {
 
 	if StartParams.Path != "/" {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// nolint: errcheck
 			w.Write([]byte(`<html>
     <head><title>Varnish Exporter</title></head>
     <body>
