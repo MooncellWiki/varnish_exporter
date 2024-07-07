@@ -70,23 +70,22 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 	if err := dec.Decode(&metricsJSON); err != nil {
 		return buf, err
 	}
-
-	countersJSON := make(map[string]interface{})
+	var countersJSON map[string]interface{}
 	// From Varnish 6.5 https://varnish-cache.org/docs/6.5/whats-new/upgrading-6.5.html#varnishstat
 	if metricsJSON["version"] != nil {
 		version_raw, ok := metricsJSON["version"].(json.Number)
 		if !ok {
-			return nil, fmt.Errorf("Unhandled json stats version type: %T %#v", metricsJSON["version"], metricsJSON["version"])
+			return nil, fmt.Errorf("unhandled json stats version type: %T %#v", metricsJSON["version"], metricsJSON["version"])
 		}
 		version, err := version_raw.Int64()
 		if err != nil {
-			return nil, fmt.Errorf("Unhandled json stats version type: %s", err)
+			return nil, fmt.Errorf("unhandled json stats version type: %s", err)
 		}
 		switch version {
 		case 1:
 			countersJSON = metricsJSON["counters"].(map[string]interface{})
 		default:
-			return nil, fmt.Errorf("Unimplemented json stats version %d", version)
+			return nil, fmt.Errorf("unimplemented json stats version %d", version)
 		}
 	} else {
 		countersJSON = metricsJSON
@@ -125,7 +124,7 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 		)
 		flag, _ := stringProperty(data, "flag")
 
-		if value, ok := data["description"]; ok && vErr == nil {
+		if value, ok := data["description"]; ok {
 			if vDescription, ok = value.(string); !ok {
 				vErr = fmt.Errorf("%s description it not a string", vName)
 			}
@@ -227,7 +226,7 @@ func executeVarnishstat(varnishstatExe string, params ...string) (*bytes.Buffer,
 // 'VBE.reload_20191014_091124_78599' as by varnishreload in 6+
 func findMostRecentVbeReloadPrefix(countersJSON map[string]interface{}) string {
 	var mostRecentVbeReloadPrefix string
-	for vName, _ := range countersJSON {
+	for vName := range countersJSON {
 		// Checking only the required ".happy" stat
 		if strings.HasPrefix(vName, vbeReload) && strings.HasSuffix(vName, ".happy") {
 			dotAfterPrefixIndex := len(vbeReload) + strings.Index(vName[len(vbeReload):], ".")
@@ -287,7 +286,7 @@ func (v *varnishVersion) queryVersion() error {
 	if scanner := bufio.NewScanner(buf); scanner.Scan() {
 		return v.parseVersion(scanner.Text())
 	}
-	return fmt.Errorf("Failed to get varnishstat -V output")
+	return fmt.Errorf("failed to get varnishstat -V output")
 }
 
 func (v *varnishVersion) parseVersion(version string) error {
@@ -307,7 +306,7 @@ func (v *varnishVersion) parseVersion(version string) error {
 		}
 	}
 	if !v.Valid() {
-		return fmt.Errorf("Failed to resolve version from %q", version)
+		return fmt.Errorf("failed to resolve version from %q", version)
 	}
 	return nil
 }

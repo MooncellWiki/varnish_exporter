@@ -122,7 +122,7 @@ func main() {
 	}
 
 	// Test run or user explicitly wants to exit on any scrape errors during runtime.
-	ExitHandler.exitOnError = StartParams.Test == true || StartParams.ExitOnErrors == true
+	ExitHandler.exitOnError = StartParams.Test || StartParams.ExitOnErrors
 
 	if b, err := json.MarshalIndent(StartParams, "", "  "); err == nil {
 		logInfo("%s %s %s", ApplicationName, getVersion(false), b)
@@ -132,6 +132,7 @@ func main() {
 
 	// Initialize
 	if err := VarnishVersion.Initialize(); err != nil {
+		// nolint: errcheck
 		ExitHandler.Errorf("Varnish version initialize failed: %s", err.Error())
 	}
 	if VarnishVersion.Valid() {
@@ -159,12 +160,13 @@ func main() {
 		<-done
 
 		if err == nil {
-			logInfo("Test scrape done in %s", time.Now().Sub(tStart))
+			logInfo("Test scrape done in %s", time.Since(tStart))
 			logRaw("")
 		} else {
 			if len(buf) > 0 {
 				logRaw("\n%s", buf)
 			}
+			// nolint: errcheck
 			ExitHandler.Errorf("Startup test: %s", err.Error())
 		}
 	}
@@ -191,6 +193,7 @@ func main() {
 
 	if StartParams.Path != "/" {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// nolint: errcheck
 			w.Write([]byte(`<html>
     <head><title>Varnish Exporter</title></head>
     <body>

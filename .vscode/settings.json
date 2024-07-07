@@ -1,5 +1,3 @@
 {
-    "editor.formatOnSave": true,
-    "go.buildOnSave": "package",
-    "go.lintOnSave": "off"
+  "editor.formatOnSave": true
 }

@@ -1,5 +1,3 @@
-[![Build Status](https://travis-ci.com/jonnenauha/prometheus_varnish_exporter.svg?branch=master)](https://travis-ci.com/github/jonnenauha/prometheus_varnish_exporter)
-
 # Varnish exporter for Prometheus
 
 ![Grafana example](dashboards/jonnenauha/dashboard.png)
@@ -67,7 +65,7 @@ To aggregate all loaded VCLs into per-backend metric the following Prometheus [r
 
 This repot support go modules so out of `GOPATH` builds are supported. This makes development and buildings easier for go "novices".
 
-You need go 1.11 or higher, otherwise you can keep using `GOPATH` based development ([see old README](https://github.com/jonnenauha/prometheus_varnish_exporter/blob/1.4.1/README.md#build)).
+You need go 1.22 or higher.
 
 1. [Install latest go](https://golang.org/doc/install) or use OS repos `golang` package.
 
@@ -75,12 +73,12 @@ You need go 1.11 or higher, otherwise you can keep using `GOPATH` based developm
 
 ```bash
 # clone
-git clone git@github.com:jonnenauha/prometheus_varnish_exporter.git
+git clone https://github.com/MooncellWiki/varnish_exporter.git
 cd prometheus_varnish_exporter
 
 # build binary to current directory
 go build
 
 # release with cross compilation
-./build.sh <version>
+goreleaser release --snapshot --clean
 ```
