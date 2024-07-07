@@ -15,5 +15,14 @@ jobs:
         uses: actions/setup-go@v5
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+          workdir: varnish_exporter
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload assets
+        uses: actions/upload-artifact@v3
+        with:
+          name: varnish_exporter
+          path: varnish_exporter/dist/*
