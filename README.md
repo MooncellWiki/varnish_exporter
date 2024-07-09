@@ -36,7 +36,45 @@ Scraping metrics from Varnish running in a docker container is possible since 1.
 
     prometheus_varnish_exporter -docker-container-name <container_name>
 
-I still don't have a easy, clear and user friendly way of running this exporter in a docker container. For community efforts and solutions see [this issue](https://github.com/jonnenauha/prometheus_varnish_exporter/issues/25#issuecomment-492546458).
+## run exporter in contineer
+
+You need to build a image base on your varnish docker image, and share the work_dir of varnish. For example
+
+```
+# dockerfile
+FROM debian:12-slim as exporter
+RUN apt-get update \
+    && apt-get install -y curl \
+    && curl -O -L https://github.com/MooncellWiki/varnish_exporter/releases/download/1.7.0/varnish_exporter_Linux_x86_64.tar.gz \
+    && mkdir /exporter \
+    && tar -C /exporter -xzvf varnish_exporter_Linux_x86_64.tar.gz
+
+FROM varnish:7.5.0
+COPY --from=exporter /exporter/varnish_exporter /exporter/varnish_exporter
+WORKDIR /exporter
+
+ENTRYPOINT [ "./varnish_exporter" ]
+```
+
+```yml
+services:
+    varnish:
+        image: varnish:7.5.0
+        volumes:
+            - ./varnish/default.vcl:/etc/varnish/default.vcl:ro
+            - varnish_fs:/var/lib/varnish
+    varnish_exporter:
+        image: your_varnish_exporter_image
+        volumes:
+            - varnish_fs:/var/lib/varnish
+        depends_on:
+            - varnish
+        command: prometheus_varnish_exporter
+volumes:
+    varnish_fs:
+```
+
+For more detail see [this issue](https://github.com/jonnenauha/prometheus_varnish_exporter/issues/25#issuecomment-492546458).
 
 # Grafana dashboards
 
