@@ -157,38 +157,43 @@ func Test_VarnishBackendNames(t *testing.T) {
 	}
 }
 
-func Test_VarnishMetrics(t *testing.T) {
-	dir, _ := os.Getwd()
-	if !fileExists(filepath.Join(dir, "test/scrape")) {
-		t.Skipf("Cannot find test/scrape files from workind dir %s", dir)
+func readScrapeFixture(t testing.TB, version string) []byte {
+	t.Helper()
+	path := filepath.Join("test", "scrape", version+".json")
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read scrape fixture %s: %s", path, err)
 	}
-	for _, version := range testFileVersions {
-		test := filepath.Join(dir, "test/scrape", version+".json")
-		// nolint: errcheck
-		VarnishVersion.parseVersion(version)
-		t.Logf("test scrape %s", VarnishVersion)
+	return buf
+}
 
-		buf, err := os.ReadFile(test)
-		if err != nil {
-			t.Fatal(err.Error())
-		}
-		done := make(chan bool)
-		metrics := make(chan prometheus.Metric)
-		descs := []*prometheus.Desc{}
-		go func() {
-			for m := range metrics {
-				descs = append(descs, m.Desc())
-			}
-			done <- true
-		}()
-		_, err = ScrapeVarnishFrom(buf, metrics)
+func scrapeMetricsForTest(buf []byte) ([]prometheus.Metric, error) {
+	metrics := make(chan prometheus.Metric)
+	result := make(chan error, 1)
+	go func() {
+		_, err := ScrapeVarnishFrom(buf, metrics)
 		close(metrics)
-		<-done
+		result <- err
+	}()
+	var collected []prometheus.Metric
+	for metric := range metrics {
+		collected = append(collected, metric)
+	}
+	return collected, <-result
+}
 
-		if err != nil {
-			t.Fatal(err.Error())
-		}
-		t.Logf("  %d metrics", len(descs))
+func Test_VarnishMetrics(t *testing.T) {
+	for _, version := range testFileVersions {
+		t.Run(version, func(t *testing.T) {
+			metrics, err := scrapeMetricsForTest(readScrapeFixture(t, version))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(metrics) == 0 {
+				t.Fatal("fixture produced no metrics")
+			}
+			t.Logf("%d metrics", len(metrics))
+		})
 	}
 }
 
@@ -257,70 +262,53 @@ func Test_IsOutdatedVbe(t *testing.T) {
 	}
 }
 
-type testCollector struct {
-	filepath string
-	t        *testing.T
+type fixtureCollector struct {
+	data []byte
 }
 
-func (tc *testCollector) Describe(ch chan<- *prometheus.Desc) {
-}
+func (fc *fixtureCollector) Describe(ch chan<- *prometheus.Desc) {}
 
-func (tc *testCollector) Collect(ch chan<- prometheus.Metric) {
-	buf, err := os.ReadFile(tc.filepath)
-	if err != nil {
-		tc.t.Fatal(err.Error())
-	}
-	_, err = ScrapeVarnishFrom(buf, ch)
-
-	if err != nil {
-		tc.t.Fatal(err.Error())
+func (fc *fixtureCollector) Collect(ch chan<- prometheus.Metric) {
+	if _, err := ScrapeVarnishFrom(fc.data, ch); err != nil {
+		ch <- prometheus.NewInvalidMetric(prometheus.NewDesc("fixture_scrape_error", "Fixture scrape error", nil, nil), err)
 	}
 }
 
 func Test_PrometheusExport(t *testing.T) {
-	dir, _ := os.Getwd()
-	if !fileExists(filepath.Join(dir, "test/scrape")) {
-		t.Skipf("Cannot find test/scrape files from workind dir %s", dir)
-	}
 	for _, version := range testFileVersions {
-		test := filepath.Join(dir, "test/scrape", version+".json")
-		// nolint: errcheck
-		VarnishVersion.parseVersion(version)
-		t.Logf("test scrape %s", VarnishVersion)
+		t.Run(version, func(t *testing.T) {
+			registry := prometheus.NewPedanticRegistry()
+			registry.MustRegister(&fixtureCollector{data: readScrapeFixture(t, version)})
+			gathering, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		registry := prometheus.NewRegistry()
-		collector := &testCollector{filepath: test, t: t}
-		registry.MustRegister(collector)
-
-		gathering, err := registry.Gather()
-		if err != nil {
-			errors, ok := err.(prometheus.MultiError)
-			if ok {
-				for _, e := range errors {
-					t.Errorf("  Error in prometheus Gather: %#v", e)
+			metricCount := 0
+			includesVarnishBackendHappy := false
+			includesVarnishBackendUp := false
+			for _, family := range gathering {
+				if family.GetName() == "varnish_backend_happy" {
+					includesVarnishBackendHappy = true
 				}
-			} else {
-				t.Errorf("  Error in prometheus Gather: %#v", err)
+				if family.GetName() == "varnish_backend_up" {
+					includesVarnishBackendUp = true
+				}
+				metricCount += len(family.Metric)
 			}
-		}
-
-		metricCount := 0
-
-		includesVarnishBackendHappy := false
-		for _, mf := range gathering {
-			if *mf.Name == "varnish_backend_happy" {
-				includesVarnishBackendHappy = true
+			if !includesVarnishBackendHappy || !includesVarnishBackendUp {
+				t.Error("missing backend happy or derived backend up metric")
 			}
+			t.Logf("%d metrics", metricCount)
+		})
+	}
+}
 
-			metricCount += len(mf.Metric)
-		}
-
-		// Validate presence of a single metric, which is present across all versions
-		if !includesVarnishBackendHappy {
-			t.Error("Missing metric varnish_backend_happy")
-		}
-
-		t.Logf("  %d metrics", metricCount)
+func TestFixtureCollectorReportsErrors(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(&fixtureCollector{data: []byte(`{"version":1}`)})
+	if _, err := registry.Gather(); err == nil {
+		t.Fatal("expected invalid fixture to fail gathering")
 	}
 }
 
@@ -335,6 +323,12 @@ func Test_VarnishMetrics_CI(t *testing.T) {
 		return
 	}
 
+	previousParams := *StartParams
+	previousVersion := *VarnishVersion
+	t.Cleanup(func() {
+		*StartParams = previousParams
+		*VarnishVersion = previousVersion
+	})
 	StartParams.Verbose = true
 	StartParams.Raw = true
 
@@ -350,9 +344,10 @@ func Test_VarnishMetrics_CI(t *testing.T) {
 		}
 		done <- true
 	}()
-	if _, err := ScrapeVarnish(metrics); err != nil {
-		t.Fatal(err)
-	}
+	_, err := ScrapeVarnish(metrics)
 	close(metrics)
 	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
 }
