@@ -122,6 +122,23 @@ func TestScrapeVarnishSkipsMalformedCounters(t *testing.T) {
 	}
 }
 
+func TestScrapeVarnishFailsWhenEveryCounterIsMalformed(t *testing.T) {
+	// A format change that breaks every counter must not look like a healthy, empty scrape.
+	input := []byte(`{"version":1,"counters":{"MAIN.uptime":{"flag":"c","val":42},"MAIN.sess_conn":{"flag":"c","val":7}}}`)
+	metrics, err := scrapeMetricsForTest(input)
+	if err == nil || !strings.Contains(err.Error(), "skipped 2 malformed counters") {
+		t.Fatalf("error = %v, want skipped counters to be reported", err)
+	}
+	if len(metrics) != 0 {
+		t.Fatalf("got %d metrics, want none", len(metrics))
+	}
+
+	// No counters at all is not a parse failure.
+	if _, err := scrapeMetricsForTest([]byte(`{"version":1,"counters":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScrapeVarnishSkipsInvalidDescriptor(t *testing.T) {
 	// A bad descriptor must not take down a scrape that contains healthy counters.
 	key := "varnish_main_invalid_descriptor_"

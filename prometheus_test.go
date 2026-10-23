@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -35,10 +38,16 @@ func TestExporterRecoversAfterVarnishBecomesAvailable(t *testing.T) {
 	isolateExporterErrors(t)
 	unavailable := errors.New("varnishstat unavailable")
 	versionCalls, scrapeCalls := 0, 0
-	exporter := newPrometheusExporter(func(ch chan<- prometheus.Metric) ([]byte, error) {
+	exporter := newPrometheusExporter(func(version *varnishVersion, ch chan<- prometheus.Metric) ([]byte, error) {
 		scrapeCalls++
 		if scrapeCalls == 1 {
+			if version.Valid() {
+				t.Error("scrape received a version before discovery succeeded")
+			}
 			return nil, unavailable
+		}
+		if version.VersionString() != "7.5.0" {
+			t.Errorf("scrape received version %q, want the discovered 7.5.0", version)
 		}
 		ch <- prometheus.MustNewConstMetric(prometheus.NewDesc("varnish_main_uptime", "Uptime", nil, nil), prometheus.GaugeValue, 42)
 		return nil, nil
@@ -89,7 +98,7 @@ func TestExporterInitialize(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprintf("fail=%v", fail), func(t *testing.T) {
 			wantErr := errors.New("version unavailable")
-			exporter := newPrometheusExporter(func(chan<- prometheus.Metric) ([]byte, error) {
+			exporter := newPrometheusExporter(func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error) {
 				return nil, nil
 			}, func() (*varnishVersion, error) {
 				if fail {
@@ -99,13 +108,16 @@ func TestExporterInitialize(t *testing.T) {
 			})
 			err := exporter.Initialize()
 			if fail {
-				if !errors.Is(err, wantErr) || exporter.version != nil {
+				if !errors.Is(err, wantErr) || exporter.version != nil || exporter.VarnishVersion().Valid() {
 					t.Fatalf("failed initialization: err=%v, version=%v", err, exporter.version)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			if got := exporter.VarnishVersion().VersionString(); got != "6.5.1" {
+				t.Fatalf("VarnishVersion() = %q, want 6.5.1", got)
 			}
 			metric := &dto.Metric{}
 			if err := exporter.version.Write(metric); err != nil {
@@ -136,10 +148,38 @@ func TestExporterRemainsUncheckedAfterInitialization(t *testing.T) {
 	}
 }
 
-func TestExporterConcurrentGatherAndDescribe(t *testing.T) {
+func TestExporterLogsVersionDiscoveryErrorsOnce(t *testing.T) {
+	isolateExporterErrors(t)
+	oldLogger, oldRaw := logger, StartParams.Raw
+	var output bytes.Buffer
+	logger = log.New(&output, "", 0)
+	StartParams.Raw = false
+	t.Cleanup(func() { logger, StartParams.Raw = oldLogger, oldRaw })
+
+	versionCalls := 0
+	exporter := newPrometheusExporter(func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error) {
+		return nil, nil
+	}, func() (*varnishVersion, error) {
+		versionCalls++
+		return nil, errors.New("unparseable -V output")
+	})
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(exporter)
+	for range 3 {
+		gatherExporter(t, registry)
+	}
+	if versionCalls != 3 {
+		t.Fatalf("version queried %d times, want a retry on every scrape", versionCalls)
+	}
+	if got := strings.Count(output.String(), "unparseable -V output"); got != 1 {
+		t.Fatalf("version error logged %d times, want 1: %q", got, output.String())
+	}
+}
+
+func TestExporterConcurrentGatherAndInitialize(t *testing.T) {
 	isolateExporterErrors(t)
 	calls := 0
-	exporter := newPrometheusExporter(func(chan<- prometheus.Metric) ([]byte, error) {
+	exporter := newPrometheusExporter(func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error) {
 		calls++ // Collect must serialize access to the scraper.
 		return nil, nil
 	}, func() (*varnishVersion, error) {
@@ -149,16 +189,19 @@ func TestExporterConcurrentGatherAndDescribe(t *testing.T) {
 	registry.MustRegister(exporter)
 	const count = 16
 	var workers sync.WaitGroup
-	errs := make(chan error, count)
+	errs := make(chan error, 2*count)
 	for range count {
 		workers.Go(func() {
 			if _, err := registry.Gather(); err != nil {
 				errs <- err
 			}
 		})
+		// Initialize replaces the version state that Collect reads.
 		workers.Go(func() {
-			descs := make(chan *prometheus.Desc, 2)
-			exporter.Describe(descs)
+			if err := exporter.Initialize(); err != nil {
+				errs <- err
+			}
+			_ = exporter.VarnishVersion().String()
 		})
 	}
 	workers.Wait()

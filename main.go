@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +24,6 @@ var (
 	VersionDate     string
 
 	PrometheusExporter = NewPrometheusExporter()
-	VarnishVersion     = NewVarnishVersion()
 	ExitHandler        = &exitHandler{}
 
 	StartParams = &startParams{
@@ -61,13 +61,13 @@ func (p *varnishstatParams) isEmpty() bool {
 	return p.Instance == "" && p.VSM == ""
 }
 
-func (p *varnishstatParams) make() (params []string) {
+func (p *varnishstatParams) make(version *varnishVersion) (params []string) {
 	// -n
 	if p.Instance != "" {
 		params = append(params, "-n", p.Instance)
 	}
 	// -N is not supported by 3.x
-	if p.VSM != "" && VarnishVersion.EqualsOrGreater(4, 0) {
+	if p.VSM != "" && version.EqualsOrGreater(4, 0) {
 		params = append(params, "-N", p.VSM)
 	}
 	return params
@@ -112,8 +112,10 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := StartParams.validate(); err != nil {
-		logFatal("%s", err)
+	// Building the handler validates the HTTP paths before querying Varnish.
+	handler, err := newHTTPHandler(StartParams, PrometheusExporter)
+	if err != nil {
+		logFatal("HTTP handler initialize failed: %s", err)
 	}
 
 	// Don't log warning on !noExit as that would spam for the formed default value.
@@ -131,15 +133,11 @@ func main() {
 	}
 
 	// Initialize
-	if err := VarnishVersion.Initialize(); err != nil {
+	if err := PrometheusExporter.Initialize(); err != nil {
 		// nolint: errcheck
 		ExitHandler.Errorf("Varnish version initialize failed: %s", err.Error())
-	}
-	if VarnishVersion.Valid() {
-		logInfo("Found varnishstat %s", VarnishVersion)
-		if err := PrometheusExporter.Initialize(); err != nil {
-			logFatal("Prometheus exporter initialize failed: %s", err.Error())
-		}
+	} else {
+		logInfo("Found varnishstat %s", PrometheusExporter.VarnishVersion())
 	}
 
 	// Test to verify everything is ok before starting the server
@@ -155,7 +153,7 @@ func main() {
 			done <- true
 		}()
 		tStart := time.Now()
-		buf, err := ScrapeVarnish(metrics)
+		buf, err := ScrapeVarnish(PrometheusExporter.VarnishVersion(), metrics)
 		close(metrics)
 		<-done
 
@@ -177,48 +175,45 @@ func main() {
 	// Start serving
 	logInfo("Server starting on %s with metrics path %s", StartParams.ListenAddress, StartParams.Path)
 
-	handler, err := newHTTPHandler(StartParams, PrometheusExporter)
-	if err != nil {
-		logFatal("HTTP handler initialize failed: %s", err)
+	server := &http.Server{
+		Addr:              StartParams.ListenAddress,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
-	logFatalError(http.ListenAndServe(StartParams.ListenAddress, handler))
+	logFatalError(server.ListenAndServe())
 }
 
-func (p *startParams) validate() (err error) {
+func (p *startParams) validate() error {
 	if len(p.Path) == 0 || p.Path[0] != '/' {
 		return fmt.Errorf("-web.telemetry-path cannot be empty and must start with a slash '/', given %q", p.Path)
 	}
 	if len(p.HealthPath) != 0 && p.HealthPath[0] != '/' {
 		return fmt.Errorf("-web.health-path must start with a slash '/' if configured, given %q", p.HealthPath)
 	}
+	// ServeMux wildcards would match many URLs and break the landing page link.
+	if strings.ContainsAny(p.Path, "{}") {
+		return fmt.Errorf("-web.telemetry-path must be a literal path without wildcards, given %q", p.Path)
+	}
+	if strings.ContainsAny(p.HealthPath, "{}") {
+		return fmt.Errorf("-web.health-path must be a literal path without wildcards, given %q", p.HealthPath)
+	}
 	if p.Path == p.HealthPath {
 		return fmt.Errorf("-web.telemetry-path and -web.health-path cannot have same value")
-	}
-
-	// ServeMux panics on malformed or conflicting patterns. Validate the full
-	// route set before querying Varnish or starting the HTTP server.
-	mux := http.NewServeMux()
-	placeholder := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	defer func() {
-		if reason := recover(); reason != nil {
-			err = fmt.Errorf("invalid HTTP path configuration: %v", reason)
-		}
-	}()
-	mux.Handle(p.Path, placeholder)
-	if p.Path != "/" && p.HealthPath != "/" {
-		mux.Handle("/", placeholder)
-	}
-	if p.HealthPath != "" {
-		mux.Handle(p.HealthPath, placeholder)
 	}
 	return nil
 }
 
 // newHTTPHandler keeps metrics and routes local to this exporter instance.
-func newHTTPHandler(params *startParams, collector prometheus.Collector) (http.Handler, error) {
+func newHTTPHandler(params *startParams, collector prometheus.Collector) (handler http.Handler, err error) {
 	if err := params.validate(); err != nil {
 		return nil, err
 	}
+	// ServeMux panics on malformed patterns, report them as configuration errors.
+	defer func() {
+		if reason := recover(); reason != nil {
+			handler, err = nil, fmt.Errorf("invalid HTTP path configuration: %v", reason)
+		}
+	}()
 
 	registry := prometheus.NewRegistry()
 	if err := registry.Register(collector); err != nil {
@@ -235,6 +230,9 @@ func newHTTPHandler(params *startParams, collector prometheus.Collector) (http.H
 
 	metricsHandler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 		ErrorLog: logger,
+		// Serve the valid metrics when some are inconsistent rather than a 500
+		// that also hides varnish_up.
+		ErrorHandling: promhttp.ContinueOnError,
 	})
 	if params.WithGoMetrics {
 		metricsHandler = promhttp.InstrumentMetricHandler(registry, metricsHandler)

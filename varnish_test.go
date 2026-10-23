@@ -324,30 +324,32 @@ func Test_VarnishMetrics_CI(t *testing.T) {
 	}
 
 	previousParams := *StartParams
-	previousVersion := *VarnishVersion
-	t.Cleanup(func() {
-		*StartParams = previousParams
-		*VarnishVersion = previousVersion
-	})
+	t.Cleanup(func() { *StartParams = previousParams })
 	StartParams.Verbose = true
 	StartParams.Raw = true
+	isolateExporterErrors(t)
 
-	if err := VarnishVersion.Initialize(); err != nil {
+	// Gather through the real exporter so version discovery, varnishstat
+	// arguments and parsing are all exercised against the live instance.
+	exporter := NewPrometheusExporter()
+	if err := exporter.Initialize(); err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("varnishstat %s", exporter.VarnishVersion())
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(exporter)
+	families := gatherExporter(t, registry)
 
-	done := make(chan bool)
-	metrics := make(chan prometheus.Metric)
-	go func() {
-		for m := range metrics {
-			t.Logf("%s", m.Desc())
+	if up := families["varnish_up"]; up == nil || up.GetMetric()[0].GetGauge().GetValue() != 1 {
+		t.Fatalf("varnish_up = %v, want 1", up)
+	}
+	for _, name := range []string{"varnish_version", "varnish_main_uptime", "varnish_backend_happy", "varnish_backend_up"} {
+		if families[name] == nil {
+			t.Errorf("live scrape is missing %s", name)
 		}
-		done <- true
-	}()
-	_, err := ScrapeVarnish(metrics)
-	close(metrics)
-	<-done
-	if err != nil {
-		t.Fatal(err)
 	}
+	if len(families) < 50 {
+		t.Errorf("live scrape exported %d metric families, want at least 50", len(families))
+	}
+	t.Logf("%d metric families", len(families))
 }

@@ -21,30 +21,29 @@ type prometheusExporter struct {
 	up      prometheus.Gauge
 	version prometheus.Gauge
 
-	scrape      func(chan<- prometheus.Metric) ([]byte, error)
+	// varnishVersion selects varnishstat arguments, invalid until discovered.
+	varnishVersion *varnishVersion
+	// versionErr is the last logged version discovery error.
+	versionErr string
+
+	scrape      func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error)
 	readVersion func() (*varnishVersion, error)
 }
 
 func NewPrometheusExporter() *prometheusExporter {
-	return newPrometheusExporter(ScrapeVarnish, func() (*varnishVersion, error) {
-		if !VarnishVersion.Valid() {
-			if err := VarnishVersion.Initialize(); err != nil {
-				return nil, err
-			}
-		}
-		return VarnishVersion, nil
-	})
+	return newPrometheusExporter(ScrapeVarnish, queryVarnishVersion)
 }
 
-func newPrometheusExporter(scrape func(chan<- prometheus.Metric) ([]byte, error), readVersion func() (*varnishVersion, error)) *prometheusExporter {
+func newPrometheusExporter(scrape func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error), readVersion func() (*varnishVersion, error)) *prometheusExporter {
 	return &prometheusExporter{
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: exporterNamespace,
 			Name:      "up",
 			Help:      "Was the last scrape of varnish successful.",
 		}),
-		scrape:      scrape,
-		readVersion: readVersion,
+		varnishVersion: NewVarnishVersion(),
+		scrape:         scrape,
+		readVersion:    readVersion,
 	}
 }
 
@@ -54,12 +53,20 @@ func (pe *prometheusExporter) Initialize() error {
 	return pe.initializeVersion()
 }
 
+// VarnishVersion returns the discovered Varnish version, invalid if unknown.
+func (pe *prometheusExporter) VarnishVersion() *varnishVersion {
+	pe.RLock()
+	defer pe.RUnlock()
+	return pe.varnishVersion
+}
+
 // initializeVersion is called with the exporter lock held.
 func (pe *prometheusExporter) initializeVersion() error {
 	version, err := pe.readVersion()
 	if err != nil {
 		return err
 	}
+	pe.varnishVersion = version
 	pe.version = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   exporterNamespace,
 		Name:        "version",
@@ -88,12 +95,15 @@ func (pe *prometheusExporter) Collect(ch chan<- prometheus.Metric) {
 	// when we started, but installed while we are running.
 	if pe.version == nil {
 		// Keep retrying version discovery if Varnish was unavailable at startup.
-		_ = pe.initializeVersion()
+		if err := pe.initializeVersion(); err != nil && err.Error() != pe.versionErr {
+			pe.versionErr = err.Error()
+			logWarn("Varnish version discovery failed: %s", err)
+		}
 	}
 
 	hadError := ExitHandler.HasError()
 
-	_, err := pe.scrape(ch)
+	_, err := pe.scrape(pe.varnishVersion, ch)
 	_ = ExitHandler.Set(err)
 
 	if err == nil {

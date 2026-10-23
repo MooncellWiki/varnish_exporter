@@ -59,15 +59,15 @@ func TestStartParamsValidate(t *testing.T) {
 		{name: "custom health", path: "/stats", healthPath: "/health"},
 		{name: "metrics at root", path: "/", healthPath: "/health"},
 		{name: "health at root", path: "/metrics", healthPath: "/"},
-		{name: "patterned paths", path: "/metrics/{instance}", healthPath: "/health/{$}"},
 		{name: "empty metrics", wantErr: "telemetry-path"},
 		{name: "relative metrics", path: "metrics", wantErr: "telemetry-path"},
 		{name: "relative health", path: "/metrics", healthPath: "health", wantErr: "health-path"},
 		{name: "conflicting paths", path: "/metrics", healthPath: "/metrics", wantErr: "same value"},
-		{name: "malformed metrics pattern", path: "/metrics/{", wantErr: "invalid HTTP path configuration"},
-		{name: "malformed health pattern", path: "/metrics", healthPath: "/health/{", wantErr: "invalid HTTP path configuration"},
-		{name: "conflicting wildcard patterns", path: "/{a}/metrics", healthPath: "/health/{b}", wantErr: "conflicts with pattern"},
-		{name: "conflicting landing pattern", path: "/{rest...}", wantErr: "conflicts with pattern"},
+		{name: "wildcard metrics", path: "/metrics/{instance}", wantErr: "-web.telemetry-path must be a literal path"},
+		{name: "exact match metrics", path: "/metrics/{$}", wantErr: "-web.telemetry-path must be a literal path"},
+		{name: "malformed metrics pattern", path: "/metrics/{", wantErr: "-web.telemetry-path must be a literal path"},
+		{name: "catch-all metrics", path: "/{rest...}", wantErr: "-web.telemetry-path must be a literal path"},
+		{name: "wildcard health", path: "/metrics", healthPath: "/health/{$}", wantErr: "-web.health-path must be a literal path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := (&startParams{Path: tc.path, HealthPath: tc.healthPath}).validate()

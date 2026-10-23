@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -87,22 +89,37 @@ func TestHTTPHandlerWithGoMetrics(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerPatternedRoutes(t *testing.T) {
-	metric := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_exporter_value", Help: "Test value."})
-	metric.Set(42)
-	handler, err := newHTTPHandler(&startParams{Path: "/metrics/{instance}", HealthPath: "/health/{$}"}, metric)
+// duplicateCollector emits one valid metric and one duplicated series.
+type duplicateCollector struct{}
+
+func (duplicateCollector) Describe(chan<- *prometheus.Desc) {}
+
+func (duplicateCollector) Collect(ch chan<- prometheus.Metric) {
+	up := prometheus.NewDesc("test_up", "Test up.", nil, nil)
+	ch <- prometheus.MustNewConstMetric(up, prometheus.GaugeValue, 1)
+	backend := prometheus.NewDesc("test_backend", "Test backend.", []string{"backend"}, nil)
+	for range 2 {
+		ch <- prometheus.MustNewConstMetric(backend, prometheus.GaugeValue, 1, "default")
+	}
+}
+
+func TestHTTPHandlerServesValidMetricsOnGatherErrors(t *testing.T) {
+	oldLogger := logger
+	var output bytes.Buffer
+	logger = log.New(&output, "", 0)
+	t.Cleanup(func() { logger = oldLogger })
+
+	handler, err := newHTTPHandler(&startParams{Path: "/metrics"}, duplicateCollector{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]string{
-		"/metrics/default": "test_exporter_value 42\n",
-		"/health/":         "Ok\n",
-	} {
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), want) {
-			t.Errorf("GET %s = %d %q, want status 200 and %q", path, response.Code, response.Body.String(), want)
-		}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "test_up 1\n") {
+		t.Fatalf("metrics response = %d %q, want status 200 with test_up", response.Code, response.Body.String())
+	}
+	if !strings.Contains(output.String(), "collected before with the same name and label values") {
+		t.Fatalf("gather error was not logged: %q", output.String())
 	}
 }
 
@@ -134,12 +151,22 @@ func TestHTTPHandlerRejectsInvalidConfiguration(t *testing.T) {
 		{Path: "/metrics", HealthPath: "health"},
 		{Path: "/metrics", HealthPath: "/metrics"},
 		{Path: "/metrics/{"},
-		{Path: "/metrics", HealthPath: "/health/{"},
-		{Path: "/{a}/metrics", HealthPath: "/health/{b}"},
+		{Path: "/metrics", HealthPath: "/health/{$}"},
 		{Path: "/{rest...}"},
 	} {
 		if handler, err := newHTTPHandler(params, metric); err == nil || handler != nil {
 			t.Fatalf("newHTTPHandler(%+v) = %v, %v; want nil handler and an error", params, handler, err)
+		}
+	}
+
+	// Paths that pass validate() but that ServeMux cannot parse must not panic.
+	for _, params := range []*startParams{
+		{Path: "/metrics extra"},
+		{Path: "/metrics", HealthPath: "/health extra"},
+	} {
+		handler, err := newHTTPHandler(params, metric)
+		if err == nil || handler != nil || !strings.Contains(err.Error(), "invalid HTTP path configuration") {
+			t.Fatalf("newHTTPHandler(%+v) = %v, %v; want invalid HTTP path configuration", params, handler, err)
 		}
 	}
 }

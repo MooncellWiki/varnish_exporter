@@ -2,7 +2,14 @@ name: test
 
 on:
   push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
   workflow_dispatch:
     inputs:
       integration:
@@ -13,9 +20,11 @@ on:
 permissions:
   contents: read
 
+# Only superseded pull request runs are cancelled; push and manual runs each
+# get their own group so they cannot cancel one another.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
