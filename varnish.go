@@ -3,14 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os/exec"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -20,9 +23,14 @@ const (
 )
 
 var (
+	// Bounds a hung varnishstat (or docker exec), which would otherwise hold
+	// the exporter lock and block every following scrape.
+	varnishstatTimeout = 10 * time.Second
+
 	DescCache = &descCache{
 		descs: make(map[string]*prometheus.Desc),
 	}
+	versionPattern = regexp.MustCompile(`(?P<major>\d+)(\.(?P<minor>\d+))?(\.(?P<patch>\d+))?(.*revision\s(?P<revision>[0-9a-f]*)\))?`)
 )
 
 type descCache struct {
@@ -45,54 +53,66 @@ func (dc *descCache) Set(key string, desc *prometheus.Desc) *prometheus.Desc {
 	return desc
 }
 
-func ScrapeVarnish(ch chan<- prometheus.Metric) ([]byte, error) {
+func ScrapeVarnish(version *varnishVersion, ch chan<- prometheus.Metric) ([]byte, error) {
 	params := []string{"-j"}
-	if VarnishVersion.EqualsOrGreater(4, 1) {
+	if version.EqualsOrGreater(4, 1) {
 		// 4.1 started to support timeout to exit immediately on connection errors.
 		// Before that varnishstat exits immediately on faulty params or connection errors.
 		params = append(params, "-t", "0")
 	}
 	if !StartParams.Params.isEmpty() {
-		params = append(params, StartParams.Params.make()...)
+		params = append(params, StartParams.Params.make(version)...)
 	}
-	buf, errExec := executeVarnishstat(StartParams.VarnishstatExe, params...)
+	stdout, stderr, errExec := executeVarnishstat(StartParams.VarnishstatExe, params...)
 	if errExec != nil {
-		return buf.Bytes(), fmt.Errorf("%s scrape failed: %s", StartParams.VarnishstatExe, errExec)
+		return append(stdout, stderr...), fmt.Errorf("%s scrape failed: %s", StartParams.VarnishstatExe, errExec)
 	}
-	return ScrapeVarnishFrom(buf.Bytes(), ch)
+	if len(stderr) > 0 && StartParams.Verbose {
+		logWarn("%s stderr: %s", StartParams.VarnishstatExe, bytes.TrimSpace(stderr))
+	}
+	return ScrapeVarnishFrom(stdout, ch)
 }
 
 func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) {
-	// The output JSON annoyingly is not structured so that we could make a nice map[string]struct for it.
-	metricsJSON := make(map[string]interface{})
-	dec := json.NewDecoder(bytes.NewBuffer(buf))
+	var metricsJSON map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(buf))
 	dec.UseNumber()
 	if err := dec.Decode(&metricsJSON); err != nil {
-		return buf, err
+		return buf, fmt.Errorf("decode varnishstat JSON: %w", err)
 	}
-	var countersJSON map[string]interface{}
+	if metricsJSON == nil {
+		return buf, fmt.Errorf("varnishstat JSON must be an object")
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return buf, fmt.Errorf("varnishstat JSON contains multiple values")
+		}
+		return buf, fmt.Errorf("decode trailing varnishstat JSON: %w", err)
+	}
+	countersJSON := metricsJSON
 	// From Varnish 6.5 https://varnish-cache.org/docs/6.5/whats-new/upgrading-6.5.html#varnishstat
-	if metricsJSON["version"] != nil {
-		version_raw, ok := metricsJSON["version"].(json.Number)
+	if rawVersion, present := metricsJSON["version"]; present {
+		versionNumber, ok := rawVersion.(json.Number)
 		if !ok {
-			return nil, fmt.Errorf("unhandled json stats version type: %T %#v", metricsJSON["version"], metricsJSON["version"])
+			return buf, fmt.Errorf("unhandled JSON stats version type: %T", rawVersion)
 		}
-		version, err := version_raw.Int64()
+		version, err := versionNumber.Int64()
 		if err != nil {
-			return nil, fmt.Errorf("unhandled json stats version type: %s", err)
+			return buf, fmt.Errorf("invalid JSON stats version: %w", err)
 		}
-		switch version {
-		case 1:
-			countersJSON = metricsJSON["counters"].(map[string]interface{})
-		default:
-			return nil, fmt.Errorf("unimplemented json stats version %d", version)
+		if version != 1 {
+			return buf, fmt.Errorf("unimplemented JSON stats version %d", version)
 		}
-	} else {
-		countersJSON = metricsJSON
+		countersJSON, ok = metricsJSON["counters"].(map[string]interface{})
+		if !ok {
+			return buf, fmt.Errorf("JSON stats version 1 counters must be an object")
+		}
 	}
 
 	mostRecentVbeReloadPrefix := findMostRecentVbeReloadPrefix(countersJSON)
 
+	exported, skipped := 0, 0
 	for vName, raw := range countersJSON {
 
 		if isOutdatedVbe(vName, mostRecentVbeReloadPrefix) {
@@ -101,17 +121,12 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 		if vName == "timestamp" {
 			continue
 		}
-		if dt := reflect.TypeOf(raw); dt.Kind() != reflect.Map {
-			if StartParams.Verbose {
-				logWarn("Found unexpected data from json: %s: %#v", vName, raw)
-			}
-			continue
-		}
 		data, ok := raw.(map[string]interface{})
 		if !ok {
 			if StartParams.Verbose {
-				logWarn("Failed to cast to map[string]interface{}: %s: %#v", vName, raw)
+				logWarn("Found unexpected data from JSON: %s: %#v", vName, raw)
 			}
+			skipped++
 			continue
 		}
 		var (
@@ -122,20 +137,23 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 			iValue       uint64
 			vErr         error
 		)
-		flag, _ := stringProperty(data, "flag")
+		flag, vErr := stringProperty(data, "flag")
 
-		if value, ok := data["description"]; ok {
+		if value, ok := data["description"]; ok && vErr == nil {
 			if vDescription, ok = value.(string); !ok {
-				vErr = fmt.Errorf("%s description it not a string", vName)
+				vErr = fmt.Errorf("%s description is not a string", vName)
 			}
 		}
 		if value, ok := data["ident"]; ok && vErr == nil {
 			if vIdentifier, ok = value.(string); !ok {
-				vErr = fmt.Errorf("%s ident it not a string", vName)
+				vErr = fmt.Errorf("%s ident is not a string", vName)
 			}
 		}
-		if value, ok := data["value"]; ok && vErr == nil {
-			if number, ok := value.(json.Number); ok {
+		if vErr == nil {
+			value, present := data["value"]
+			if !present {
+				vErr = fmt.Errorf("%s value is missing", vName)
+			} else if number, ok := value.(json.Number); ok {
 				if vValue, vErr = number.Float64(); vErr != nil {
 					vErr = fmt.Errorf("%s value float64 error: %s", vName, vErr)
 				}
@@ -145,28 +163,18 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 					}
 				}
 			} else {
-				vErr = fmt.Errorf("%s value it not a float64", vName)
+				vErr = fmt.Errorf("%s value is not a number", vName)
 			}
 		}
 		if vErr != nil {
 			if StartParams.Verbose {
-				logWarn(vErr.Error())
+				logWarn("%s", vErr)
 			}
+			skipped++
 			continue
 		}
 
 		pName, pDescription, pLabelKeys, pLabelValues := computePrometheusInfo(vName, vGroup, vIdentifier, vDescription)
-
-		descKey := pName + "_" + strings.Join(pLabelKeys, "_")
-		pDesc := DescCache.Desc(descKey)
-		if pDesc == nil {
-			pDesc = DescCache.Set(descKey, prometheus.NewDesc(
-				pName,
-				pDescription,
-				pLabelKeys,
-				nil,
-			))
-		}
 
 		var metricType prometheus.ValueType
 		switch flag {
@@ -178,47 +186,70 @@ func ScrapeVarnishFrom(buf []byte, ch chan<- prometheus.Metric) ([]byte, error) 
 			metricType = prometheus.GaugeValue
 		}
 
-		ch <- prometheus.MustNewConstMetric(pDesc, metricType, vValue, pLabelValues...)
+		if !sendConstMetric(ch, pName, pDescription, pLabelKeys, metricType, vValue, pLabelValues) {
+			skipped++
+			continue
+		}
+		exported++
 
 		// augment varnish_backend_up from _happy varnish bitmap value
 		// we are only interested in the latest happy value (up or down) on each scrape
 		// see draw_line_bitmap function from https://github.com/varnishcache/varnish-cache/blob/master/bin/varnishstat/varnishstat_curses.c
 		if pName == "varnish_backend_happy" {
-			upName := "varnish_backend_up"
-			upDesc := "Backend up as per the latest health probe"
 			upValue := 0.0
 			if iValue > 0 && (iValue&uint64(1)) > 0 {
 				upValue = 1.0
 			}
-
-			descKey = upName + "_" + strings.Join(pLabelKeys, "_")
-			pDesc = DescCache.Desc(descKey)
-			if pDesc == nil {
-				pDesc = DescCache.Set(descKey, prometheus.NewDesc(
-					upName,
-					upDesc,
-					pLabelKeys,
-					nil,
-				))
-			}
-			ch <- prometheus.MustNewConstMetric(pDesc, prometheus.GaugeValue, upValue, pLabelValues...)
+			sendConstMetric(ch, "varnish_backend_up", "Backend up as per the latest health probe", pLabelKeys, prometheus.GaugeValue, upValue, pLabelValues)
 		}
+	}
+	// Report a format change that breaks every counter instead of silently
+	// exporting nothing with varnish_up=1.
+	if exported == 0 && skipped > 0 {
+		return buf, fmt.Errorf("no usable counters in varnishstat JSON, skipped %d malformed counters", skipped)
 	}
 	return buf, nil
 }
 
-// Returns the result of 'varnishtat' with optional command line params.
-func executeVarnishstat(varnishstatExe string, params ...string) (*bytes.Buffer, error) {
-	buf := &bytes.Buffer{}
+// Sends a constant metric, returning false if Prometheus rejects it.
+func sendConstMetric(ch chan<- prometheus.Metric, name, help string, labelKeys []string, valueType prometheus.ValueType, value float64, labelValues []string) bool {
+	descKey := name + "_" + strings.Join(labelKeys, "_")
+	desc := DescCache.Desc(descKey)
+	if desc == nil {
+		desc = DescCache.Set(descKey, prometheus.NewDesc(name, help, labelKeys, nil))
+	}
+	metric, err := prometheus.NewConstMetric(desc, valueType, value, labelValues...)
+	if err != nil {
+		if StartParams.Verbose {
+			logWarn("Failed to create metric %s: %s", name, err)
+		}
+		return false
+	}
+	ch <- metric
+	return true
+}
+
+// Returns the stdout and stderr of 'varnishstat' with optional command line params.
+// They are kept apart so that warnings on stderr cannot corrupt the JSON on stdout.
+func executeVarnishstat(varnishstatExe string, params ...string) (stdout, stderr []byte, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), varnishstatTimeout)
+	defer cancel()
 	var cmd *exec.Cmd
 	if len(StartParams.VarnishDockerContainer) == 0 {
-		cmd = exec.Command(varnishstatExe, params...)
+		cmd = exec.CommandContext(ctx, varnishstatExe, params...)
 	} else {
-		cmd = exec.Command("docker", append([]string{"exec", "-t", StartParams.VarnishDockerContainer, varnishstatExe}, params...)...)
+		// No -t: a TTY would merge stderr into stdout.
+		cmd = exec.CommandContext(ctx, "docker", append([]string{"exec", StartParams.VarnishDockerContainer, varnishstatExe}, params...)...)
 	}
-	cmd.Stdout = buf
-	cmd.Stderr = buf
-	return buf, cmd.Run()
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
+	// Don't wait for output pipes held open by children of a killed command.
+	cmd.WaitDelay = time.Second
+	err = cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("timed out after %s: %w", varnishstatTimeout, err)
+	}
+	return outBuf.Bytes(), errBuf.Bytes(), err
 }
 
 // Returns the most recent prefix for 'VBE.reload_' stats. Empty until first reload.
@@ -243,7 +274,7 @@ func findMostRecentVbeReloadPrefix(countersJSON map[string]interface{}) string {
 func isOutdatedVbe(vName string, mostRecentVbeReloadPrefix string) bool {
 	return len(mostRecentVbeReloadPrefix) > 0 &&
 		strings.HasPrefix(vName, "VBE.") &&
-		!strings.HasPrefix(vName, mostRecentVbeReloadPrefix)
+		!strings.HasPrefix(vName, mostRecentVbeReloadPrefix+".")
 }
 
 // varnishVersion
@@ -278,36 +309,49 @@ func (v *varnishVersion) Initialize() error {
 	return v.queryVersion()
 }
 
+// Queries a fresh varnishVersion from varnishstat.
+func queryVarnishVersion() (*varnishVersion, error) {
+	version := NewVarnishVersion()
+	if err := version.Initialize(); err != nil {
+		return nil, err
+	}
+	return version, nil
+}
+
 func (v *varnishVersion) queryVersion() error {
-	buf, err := executeVarnishstat(StartParams.VarnishstatExe, "-V")
+	stdout, stderr, err := executeVarnishstat(StartParams.VarnishstatExe, "-V")
 	if err != nil {
 		return err
 	}
-	if scanner := bufio.NewScanner(buf); scanner.Scan() {
+	// varnishstat -V prints to stderr, stdout is checked first for wrappers.
+	scanner := bufio.NewScanner(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)))
+	if scanner.Scan() {
 		return v.parseVersion(scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read varnishstat -V output: %w", err)
 	}
 	return fmt.Errorf("failed to get varnishstat -V output")
 }
 
 func (v *varnishVersion) parseVersion(version string) error {
-	r := regexp.MustCompile(`(?P<major>\d+)(\.(?P<minor>\d+))?(\.(?P<patch>\d+))?(.*revision\s(?P<revision>[0-9a-f]*)\))?`)
-	match := r.FindStringSubmatch(version)
+	match := versionPattern.FindStringSubmatch(version)
+	if match == nil {
+		return fmt.Errorf("failed to resolve version from %q", version)
+	}
 
 	parts := make(map[string]string)
-	for i, name := range r.SubexpNames() {
+	for i, name := range versionPattern.SubexpNames() {
 		if i != 0 && name != "" {
 			parts[name] = match[i]
 		}
 	}
 
-	if len(parts) > 1 {
-		if err := v.set(parts); err != nil {
-			return err
-		}
+	parsed := NewVarnishVersion()
+	if err := parsed.set(parts); err != nil {
+		return fmt.Errorf("failed to resolve version from %q: %w", version, err)
 	}
-	if !v.Valid() {
-		return fmt.Errorf("failed to resolve version from %q", version)
-	}
+	*v = *parsed
 	return nil
 }
 

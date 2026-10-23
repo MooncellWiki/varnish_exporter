@@ -2,20 +2,90 @@ name: test
 
 on:
   push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: Run the live Varnish integration test matrix
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Only superseded pull request runs are cancelled; push and manual runs each
+# get their own group so they cannot cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
-    name: test
+    name: Go ${{ matrix.go }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [1.26.x, 1.27.x]
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Go 1.22
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: 1.22.x
-      - name: Display Go version
-        run: go version
-      - name: Install dependencies
-        run: go get .
-      - name: Test with Go
-        run: go test
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.sum
+      - run: make check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-go-${{ matrix.go }}
+          path: coverage.out
+          retention-days: 14
+
+  integration:
+    name: Varnish ${{ matrix.varnish }}
+    if: github.event_name == 'workflow_dispatch' && inputs.integration
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        varnish: ["7.5.0", "9.1.0-2"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: go.sum
+      - name: Start Varnish
+        env:
+          VARNISH_IMAGE: varnish:${{ matrix.varnish }}
+        run: |
+          docker run --detach --name varnish-integration \
+            --tmpfs /var/lib/varnish/varnishd:exec \
+            "$VARNISH_IMAGE" varnishd -F -a :80 -b 127.0.0.1:8080 -s malloc,32m
+          for _ in {1..30}; do
+            if docker exec varnish-integration varnishstat -j > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - name: Test with container varnishstat
+        run: |
+          mkdir -p "$RUNNER_TEMP/varnish-bin"
+          cat > "$RUNNER_TEMP/varnish-bin/varnishstat" <<'SCRIPT'
+          #!/bin/sh
+          exec docker exec varnish-integration varnishstat "$@"
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/varnish-bin/varnishstat"
+          PATH="$RUNNER_TEMP/varnish-bin:$PATH" make integration
+      - name: Varnish logs and cleanup
+        if: always()
+        run: |
+          docker logs varnish-integration
+          docker rm --force varnish-integration

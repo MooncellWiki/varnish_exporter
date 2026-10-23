@@ -50,7 +50,7 @@ func logFatal(format string, args ...interface{}) {
 
 func logFatalError(err error) {
 	if err != nil {
-		logFatal(err.Error())
+		logFatal("%s", err)
 	}
 }
 
@@ -77,19 +77,6 @@ func startsWithAny(str string, prefixes []string, cs caseSensitivity) bool {
 		}
 	}
 	return false
-}
-
-// file
-
-// Returns if file/dir in path exists.
-func fileExists(path string) bool {
-	if len(path) == 0 {
-		return false
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return false
-	}
-	return true
 }
 
 // data

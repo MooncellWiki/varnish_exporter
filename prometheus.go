@@ -20,24 +20,58 @@ type prometheusExporter struct {
 
 	up      prometheus.Gauge
 	version prometheus.Gauge
+
+	// varnishVersion selects varnishstat arguments, invalid until discovered.
+	varnishVersion *varnishVersion
+	// versionErr is the last logged version discovery error.
+	versionErr string
+
+	scrape      func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error)
+	readVersion func() (*varnishVersion, error)
 }
 
 func NewPrometheusExporter() *prometheusExporter {
+	return newPrometheusExporter(ScrapeVarnish, queryVarnishVersion)
+}
+
+func newPrometheusExporter(scrape func(*varnishVersion, chan<- prometheus.Metric) ([]byte, error), readVersion func() (*varnishVersion, error)) *prometheusExporter {
 	return &prometheusExporter{
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: exporterNamespace,
 			Name:      "up",
 			Help:      "Was the last scrape of varnish successful.",
 		}),
+		varnishVersion: NewVarnishVersion(),
+		scrape:         scrape,
+		readVersion:    readVersion,
 	}
 }
 
 func (pe *prometheusExporter) Initialize() error {
+	pe.Lock()
+	defer pe.Unlock()
+	return pe.initializeVersion()
+}
+
+// VarnishVersion returns the discovered Varnish version, invalid if unknown.
+func (pe *prometheusExporter) VarnishVersion() *varnishVersion {
+	pe.RLock()
+	defer pe.RUnlock()
+	return pe.varnishVersion
+}
+
+// initializeVersion is called with the exporter lock held.
+func (pe *prometheusExporter) initializeVersion() error {
+	version, err := pe.readVersion()
+	if err != nil {
+		return err
+	}
+	pe.varnishVersion = version
 	pe.version = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   exporterNamespace,
 		Name:        "version",
 		Help:        "Varnish version information",
-		ConstLabels: VarnishVersion.Labels(),
+		ConstLabels: version.Labels(),
 	})
 	pe.version.Set(1)
 	return nil
@@ -45,16 +79,9 @@ func (pe *prometheusExporter) Initialize() error {
 
 // Implements prometheus.Collector
 func (pe *prometheusExporter) Describe(ch chan<- *prometheus.Desc) {
-	start := time.Now()
-
-	ch <- pe.up.Desc()
-	if pe.version != nil {
-		ch <- pe.version.Desc()
-	}
-
-	if StartParams.Verbose {
-		logInfo("prometheus.Collector.Describe  %s", time.Since(start))
-	}
+	// Varnish counters change after VCL reloads, and the version may become
+	// available after registration. Use an unchecked collector rather than
+	// describing only a subset of the metrics Collect can emit.
 }
 
 // Implements prometheus.Collector
@@ -66,22 +93,18 @@ func (pe *prometheusExporter) Collect(ch chan<- prometheus.Metric) {
 
 	// Rare case of varnish not being installed in the system
 	// when we started, but installed while we are running.
-	if !VarnishVersion.Valid() {
-		if VarnishVersion.Initialize() == nil {
-			pe.version = prometheus.NewGauge(prometheus.GaugeOpts{
-				Namespace:   exporterNamespace,
-				Name:        "version",
-				Help:        "Varnish version information",
-				ConstLabels: VarnishVersion.Labels(),
-			})
+	if pe.version == nil {
+		// Keep retrying version discovery if Varnish was unavailable at startup.
+		if err := pe.initializeVersion(); err != nil && err.Error() != pe.versionErr {
+			pe.versionErr = err.Error()
+			logWarn("Varnish version discovery failed: %s", err)
 		}
 	}
 
 	hadError := ExitHandler.HasError()
 
-	_, err := ScrapeVarnish(ch)
-	// nolint: errcheck
-	ExitHandler.Set(err)
+	_, err := pe.scrape(pe.varnishVersion, ch)
+	_ = ExitHandler.Set(err)
 
 	if err == nil {
 		if hadError {
@@ -200,7 +223,7 @@ var (
 
 var (
 	// (prefix:)<uuid>.<name>
-	regexBackendUUID = regexp.MustCompile(`([[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[89ABab][0-9A-Za-z]{3}-[0-9A-Za-z]{12})(.*)`)
+	regexBackendUUID = regexp.MustCompile(`([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12})(.*)`)
 	// <name>(<ip>,(<something>),<port>)
 	regexBackendParen = regexp.MustCompile(`(.*)\((.*)\)`)
 )
@@ -252,12 +275,12 @@ func computePrometheusInfo(vName, vGroup, vIdentifier, vDescription string) (nam
 		fq := strings.ToLower(vName)
 		// Remove unique identifiers from name to group similar metrics by labeling
 		if len(vIdentifier) > 0 {
-			fq = strings.Replace(fq, "."+strings.ToLower(vIdentifier), "", -1)
+			fq = strings.ReplaceAll(fq, "."+strings.ToLower(vIdentifier), "")
 		}
 		// Make sure our group is prefixed only once
 		fq = prometheusTrimGroupPrefix(fq)
 		// Build fq name
-		name = exporterNamespace + "_" + vGroup + "_" + strings.Replace(fq, ".", "_", -1)
+		name = exporterNamespace + "_" + vGroup + "_" + strings.ReplaceAll(fq, ".", "_")
 		if swapName := fqNames[name]; len(swapName) > 0 {
 			name = swapName
 		}

@@ -99,24 +99,50 @@ To aggregate all loaded VCLs into per-backend metric the following Prometheus [r
 
 # Build
 
-**One time setup**
-
-This repot support go modules so out of `GOPATH` builds are supported. This makes development and buildings easier for go "novices".
-
-You need go 1.22 or higher.
-
-1. [Install latest go](https://golang.org/doc/install) or use OS repos `golang` package.
-
-**Development**
+Go 1.26 or higher is required. CI tests the supported Go 1.26 and 1.27 release lines.
+Install Go from [go.dev](https://go.dev/doc/install); the project uses Go modules and can be built outside `GOPATH`.
 
 ```bash
 # clone
-git clone https://github.com/MooncellWiki/varnish_exporter.git
-cd prometheus_varnish_exporter
+git clone --depth 1 https://github.com/MooncellWiki/varnish_exporter.git
+cd varnish_exporter
 
-# build binary to current directory
-go build
+# build bin/varnish_exporter
+make build
 
 # release with cross compilation
-goreleaser release --snapshot --clean
+make snapshot
 ```
+
+## Testing
+
+Tests use Go's standard `testing` package, recorded Varnish JSON fixtures, and
+`httptest`. The default suite needs neither Varnish nor Docker. Fixture tests
+check Prometheus collection; regression tests cover malformed input, backend
+health bitmaps, metric names and labels, version discovery, scrape recovery,
+concurrent collection, CLI defaults, and HTTP routes.
+
+```bash
+make test                 # unit tests, fixture tests, and fuzz seeds
+make check                # formatting, module integrity, vet, race coverage, build
+make coverage             # coverage.out and a per-function report
+make fuzz FUZZTIME=30s    # fuzz the JSON and version parsers, 30 seconds each
+make lint                 # requires golangci-lint v2.15.0
+make vuln                 # runs pinned govulncheck v1.9.0
+make release-check        # requires GoReleaser v2.18.3
+```
+
+Inspect coverage with `go tool cover -html=coverage.out`. The Makefile allows
+overriding `GO`, `GOLANGCI_LINT`, and `GORELEASER`. Without Make, run
+`go test -race ./...`, `go vet ./...`, and `go build ./...` directly.
+
+`make integration` opts into a live scrape on Linux. It requires a running
+Varnish instance and a `varnishstat` command on `PATH` that can access its shared
+memory. Normal tests skip this check. In GitHub Actions, manually run the `test`
+workflow with the `integration` input enabled to run the pinned official images
+`varnish:7.5.0` and `varnish:9.1.0-2` as separate matrix jobs without host Varnish
+installation or sudo.
+
+Pull requests and pushes run the Go version matrix, lint, vulnerability scans,
+and release configuration validation. Coverage reports are uploaded as workflow
+artifacts. Release tags run the same source checks before packaging binaries.

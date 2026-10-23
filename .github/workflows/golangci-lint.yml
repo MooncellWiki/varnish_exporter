@@ -1,28 +1,53 @@
-# This action is synced from https://github.com/prometheus/prometheus
-name: golangci-lint
+name: lint
+
 on:
   push:
-    paths:
-      - "go.sum"
-      - "go.mod"
-      - "**.go"
-      - ".github/workflows/golangci-lint.yml"
-      - ".golangci.yml"
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "dashboards/**"
+
+permissions:
+  contents: read
+
+# Only superseded pull request runs are cancelled; push and manual runs each
+# get their own group so they cannot cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   golangci:
-    name: lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Install Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: 1.22.x
-      - name: Lint
-        uses: golangci/golangci-lint-action@v6
+          go-version: 1.27.x
+          cache-dependency-path: go.sum
+      - uses: golangci/golangci-lint-action@v9
         with:
-          args: --verbose
-          version: v1.59.1
+          version: v2.15.0
+
+  vulnerability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: go.sum
+      - run: make vuln
+
+  release-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.18.3
+          args: check

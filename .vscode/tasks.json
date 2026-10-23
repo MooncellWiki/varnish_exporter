@@ -22,7 +22,7 @@
                 "clear": true
             },
             "command": [
-                "go build -v"
+                "make build"
             ]
         },
         {
@@ -44,10 +44,7 @@
                 "clear": true
             },
             "command": [
-                "go test -v &&",
-                // this will most likely fail to scrape, would need sudo to access varnishd.
-                // still runs our executable and prints varnishstat version etc.
-                "./prometheus_varnish_exporter -test"
+                "make test"
             ]
         }
     ]
